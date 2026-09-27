@@ -65,7 +65,9 @@ type compositeSampler struct {
 
 // NewSampler 创建组合采样器。
 func NewSampler(cfg SamplerConfig) Sampler {
-	if cfg.Fraction <= 0 || cfg.Fraction > 1 {
+	if cfg.Fraction < 0 {
+		cfg.Fraction = 0
+	} else if cfg.Fraction > 1 {
 		cfg.Fraction = 1
 	}
 	return &compositeSampler{cfg: cfg}
