@@ -27,8 +27,9 @@ type ProcessorConfig struct {
 	RetryBackoff time.Duration
 	// DeadLetterCap 死信诊断信息保留条数上限（有界）。
 	DeadLetterCap int
-	// BlockOnFull 队列满时，对“已进入队列的链路”允许的短暂等待上界；
-	// 0 表示不等待。作用是让突发只在入口处整链降入，而不撕裂在途链路。
+	// BlockOnFull 队列满时，对“已进入管线的链路”允许的有界等待上界；
+	// 0 表示采用默认值（ExportTimeout），负值表示完全不等待（激进模式）。
+	// 作用是让突发只在入口处整链降入，而不撕裂在途链路。
 	BlockOnFull time.Duration
 	Now         func() time.Time
 }
@@ -75,7 +76,7 @@ type Processor struct {
 
 	mu          sync.Mutex
 	queue       []*trace.Span
-	leased      int // 已出队、正在导出（尚未终态）的跨度数
+	leased      int                   // 已出队、正在导出（尚未终态）的跨度数
 	traceRefs   map[trace.TraceID]int // 每条链路在“队列 + 导出在途”中的跨度总数
 	deadLetters []deadLetterEntry
 	lastFailure *Failure
@@ -119,6 +120,12 @@ func NewProcessor(cfg ProcessorConfig) *Processor {
 	}
 	if cfg.DeadLetterCap <= 0 {
 		cfg.DeadLetterCap = 128
+	}
+	if cfg.BlockOnFull == 0 {
+		// 默认让“已接纳链路”的后续跨度在满时做有限等待（取导出超时），
+		// 使“已采样链路不被局部丢弃”成为默认行为；新链路仍立即被拒。
+		// 显式传负值可关闭等待（退化为可能局部丢弃的激进模式）。
+		cfg.BlockOnFull = cfg.ExportTimeout
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now

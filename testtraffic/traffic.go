@@ -130,7 +130,8 @@ func (r *Runner) Run(ctx context.Context, scenario Scenario) ([]TraceOutcome, er
 
 // runOne 生成一条跨 4 组件的调用链，拓扑：
 // gateway(GET /checkout) -> order(create) -> payment(charge)
-//                                   \-----> notify(email)
+//
+//	\-----> notify(email)
 //
 // 各场景仅改变跨度的结束编排，父子归属在创建时已固定，
 // 因此无论怎么乱序/重复/缺失，结构结论都必须一致。

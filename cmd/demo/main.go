@@ -16,15 +16,15 @@ func main() {
 	// 1) 进程内导出管线：小容量队列以演示背压；底层为内存导出器。
 	mem := export.NewMemoryExporter()
 	proc := export.NewProcessor(export.ProcessorConfig{
-		Exporter:       mem,
-		QueueSize:      256,
-		BatchSize:      16,
-		FlushInterval:  200 * time.Millisecond,
-		ExportTimeout:  time.Second,
-		MaxAttempts:    3,
-		RetryBackoff:   5 * time.Millisecond,
-		DeadLetterCap:  32,
-		BlockOnFull:    2 * time.Millisecond,
+		Exporter:      mem,
+		QueueSize:     256,
+		BatchSize:     16,
+		FlushInterval: 200 * time.Millisecond,
+		ExportTimeout: time.Second,
+		MaxAttempts:   3,
+		RetryBackoff:  5 * time.Millisecond,
+		DeadLetterCap: 32,
+		BlockOnFull:   2 * time.Millisecond,
 	})
 
 	// 2) 每个组件一个 Tracer，共享同一 Sink 与采样器。

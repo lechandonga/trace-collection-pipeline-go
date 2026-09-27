@@ -25,10 +25,11 @@ func TestProcessorAcceptNonBlockingWhenFull(t *testing.T) {
 	// 输入：QueueSize=4、BatchSize=1，导出闸门关闭使消费冻结；
 	// 占用按“在队 + 导出在途”统一计数，因此提交 4 个后管线恰好满。
 	// 判定：随后提交立即拒绝、不阻塞调用方，背压原因可查、资源有界。
+	// BlockOnFull=-1：显式关闭在途等待，得到最严格的立即拒绝（非阻塞）模式。
 	gate := &gateExporter{open: make(chan struct{})}
 	p := NewProcessor(ProcessorConfig{
 		Exporter: gate, QueueSize: 4, BatchSize: 1,
-		FlushInterval: time.Millisecond, BlockOnFull: 0,
+		FlushInterval: time.Millisecond, BlockOnFull: -1,
 		ExportTimeout: 10 * time.Second,
 	})
 	tid := trace.NewTraceID()
@@ -255,7 +256,7 @@ func TestProcessorRetryExhaustedThenRecoveryContinues(t *testing.T) {
 func TestProcessorTimeoutIsClassifiedAndRetryable(t *testing.T) {
 	// 输入：导出器每次睡眠超过 ExportTimeout。
 	flaky := NewFlakyExporter(FlakyConfig{
-		Delay: 200 * time.Millisecond,
+		Delay:  200 * time.Millisecond,
 		Policy: func(int64) (FailureReason, bool) { return "", true },
 	})
 	p := NewProcessor(ProcessorConfig{

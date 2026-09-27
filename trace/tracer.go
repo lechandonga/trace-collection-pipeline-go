@@ -122,11 +122,11 @@ func (t *Tracer) Start(ctx context.Context, name string, opts ...SpanOption) (co
 	parent := SpanFromContext(ctx)
 
 	span := &Span{
-		SpanID:    t.spanID(),
-		Service:   t.cfg.Service,
-		Name:      name,
-		Kind:      KindInternal,
-		StartTime: now,
+		SpanID:     t.spanID(),
+		Service:    t.cfg.Service,
+		Name:       name,
+		Kind:       KindInternal,
+		StartTime:  now,
 		Attributes: map[string]string{},
 	}
 	for _, o := range opts {
@@ -220,13 +220,13 @@ func (t *Tracer) StartWithParent(ctx context.Context, remote SpanContext, name s
 	now := t.cfg.Now()
 	span := &Span{
 		TraceID:    remote.TraceID,
-		SpanID:    t.spanID(),
-		ParentID:  remote.SpanID,
-		Service:   t.cfg.Service,
-		Name:      name,
-		Kind:      KindServer,
-		StartTime: now,
-		Sampled:   remote.Sampled,
+		SpanID:     t.spanID(),
+		ParentID:   remote.SpanID,
+		Service:    t.cfg.Service,
+		Name:       name,
+		Kind:       KindServer,
+		StartTime:  now,
+		Sampled:    remote.Sampled,
 		Attributes: map[string]string{},
 	}
 	for _, o := range opts {

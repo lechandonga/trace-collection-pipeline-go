@@ -5,10 +5,10 @@ import "sync"
 // Recorder 是最简单的进程内 SpanSink：聚合所有已结束跨度，
 // 供测试按 TraceID 构建链路报告并做一致性断言。
 type Recorder struct {
-	mu      sync.Mutex
-	spans   []*Span
-	drops   []DroppedSpan
-	closed  bool
+	mu     sync.Mutex
+	spans  []*Span
+	drops  []DroppedSpan
+	closed bool
 }
 
 // NewRecorder 创建聚合记录器。

@@ -63,12 +63,12 @@ type Span struct {
 	Attributes    map[string]string
 	Sampled       bool
 
-	mu             sync.Mutex
-	events         []Event
-	endOnce        sync.Once
-	ended          atomic.Bool
-	endKind        SpanEndKind
-	duplicateEnds  int
+	mu            sync.Mutex
+	events        []Event
+	endOnce       sync.Once
+	ended         atomic.Bool
+	endKind       SpanEndKind
+	duplicateEnds int
 	// onEnd 在首次成功结束时调用一次（由 Tracer 注入，用于采集交接）。
 	onEnd func(*Span)
 }
