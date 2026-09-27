@@ -35,17 +35,19 @@ type ProcessorConfig struct {
 
 // ProcessorStats 是 Processor 的可查询状态快照。
 type ProcessorStats struct {
-	Received         int64
-	Exported         int64
-	Dropped          int64
-	UnsampledDrops   int64
+	Received          int64
+	Exported          int64
+	Dropped           int64
+	UnsampledDrops    int64
 	BackpressureDrops int64
-	Retried          int64
-	InQueue          int
-	AdmittedTraces   int
-	DeadLetters      int
-	LastFailure      *Failure
-	Available        bool
+	Retried           int64
+	InQueue           int
+	Leased            int // 已出队、正在导出中的跨度数
+	InFlight          int // InQueue + Leased：真实资源占用（不超过 QueueSize）
+	AdmittedTraces    int
+	DeadLetters       int
+	LastFailure       *Failure
+	Available         bool
 }
 
 // deadLetterEntry 保留导出彻底失败批次的关键诊断信息。
@@ -73,7 +75,8 @@ type Processor struct {
 
 	mu          sync.Mutex
 	queue       []*trace.Span
-	traceRefs   map[trace.TraceID]int // 队列中每条链路的在队跨度数
+	leased      int // 已出队、正在导出（尚未终态）的跨度数
+	traceRefs   map[trace.TraceID]int // 每条链路在“队列 + 导出在途”中的跨度总数
 	deadLetters []deadLetterEntry
 	lastFailure *Failure
 	available   bool
@@ -155,23 +158,15 @@ func (p *Processor) Accept(span *trace.Span) bool {
 		return false
 	}
 	_, inFlight := p.traceRefs[span.TraceID]
-	if len(p.queue) >= p.cfg.QueueSize {
-		if inFlight && p.cfg.BlockOnFull > 0 {
-			if p.waitRoom(p.cfg.BlockOnFull) {
-				// 等待期间出现空位，落入下方正常入队路径。
-				inFlight = true
-			} else {
-				p.mu.Unlock()
-				p.backpressureDrops.Add(1)
-				p.dropped.Add(1)
-				return false
-			}
-		} else if !inFlight {
+	for len(p.queue)+p.leased >= p.cfg.QueueSize {
+		if !inFlight || p.cfg.BlockOnFull <= 0 {
 			p.mu.Unlock()
 			p.backpressureDrops.Add(1)
 			p.dropped.Add(1)
 			return false
-		} else {
+		}
+		// 在途链路：最多等待 BlockOnFull，绝不无限阻塞调用方。
+		if !p.waitRoom(p.cfg.BlockOnFull) {
 			p.mu.Unlock()
 			p.backpressureDrops.Add(1)
 			p.dropped.Add(1)
@@ -192,27 +187,34 @@ func (p *Processor) Accept(span *trace.Span) bool {
 	return true
 }
 
-// waitRoom 在锁内等待队列出现空位，超时返回 false。调用时持有 p.mu。
+// waitRoom 在持有 p.mu 的情况下等待“真实占用”低于容量或管线关闭，
+// 最多等待 timeout；返回 true 表示出现空位，false 表示超时/关闭。
+// 唤醒源是批次终态（releaseBatchFinalized）与 Shutdown 的 Broadcast。
 func (p *Processor) waitRoom(timeout time.Duration) bool {
-	deadline := time.After(timeout)
-	done := make(chan struct{})
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	wake := make(chan struct{})
 	go func() {
 		select {
-		case <-deadline:
-			p.notFull.Broadcast() // 唤醒等待者以重新检查超时
-		case <-done:
+		case <-timer.C:
+			p.notFull.Broadcast() // 超时后唤醒等待者重新检查
+		case <-wake:
 		}
 	}()
-	for len(p.queue) >= p.cfg.QueueSize {
+	for len(p.queue)+p.leased >= p.cfg.QueueSize {
+		if p.closed {
+			close(wake)
+			return false
+		}
 		p.notFull.Wait()
 		select {
-		case <-deadline:
-			close(done)
-			return len(p.queue) < p.cfg.QueueSize
+		case <-timer.C:
+			close(wake)
+			return len(p.queue)+p.leased < p.cfg.QueueSize
 		default:
 		}
 	}
-	close(done)
+	close(wake)
 	return true
 }
 
@@ -250,53 +252,72 @@ func (p *Processor) ShutdownCtx(ctx context.Context) error {
 	p.wg.Wait()
 
 	// 工作协程退出后队列归本协程独占：尽力排空。
-	p.mu.Lock()
-	rest := append([]*trace.Span(nil), p.queue...)
-	p.queue = p.queue[:0]
-	p.traceRefs = make(map[trace.TraceID]int)
-	p.mu.Unlock()
-	p.notFull.Broadcast()
-
-	for len(rest) > 0 {
-		n := p.cfg.BatchSize
-		if n > len(rest) {
-			n = len(rest)
+	var lastErr error
+	for {
+		p.mu.Lock()
+		batch := p.takeBatchLocked()
+		p.mu.Unlock()
+		if len(batch) == 0 {
+			break
 		}
-		if err := p.exportBatch(ctx, rest[:n]); err != nil {
-			// 死信已在 exportBatch 内记录；关闭流程继续但返回最后错误。
-			rest = rest[n:]
-			_ = err
-			continue
+		if err := p.exportBatch(ctx, batch); err != nil {
+			lastErr = err // 死信已记录；继续排空，最后返回最后一个错误
 		}
-		rest = rest[n:]
+		p.releaseBatchFinalized(batch)
 	}
-	return p.cfg.Exporter.Shutdown(ctx)
+	if err := p.cfg.Exporter.Shutdown(ctx); err != nil {
+		return err
+	}
+	return lastErr
 }
 
 // Flush 立即导出当前队列中的全部跨度（按 BatchSize 分批）。
 func (p *Processor) Flush(ctx context.Context) error {
 	for {
 		p.mu.Lock()
-		if len(p.queue) == 0 {
-			p.mu.Unlock()
+		batch := p.takeBatchLocked()
+		p.mu.Unlock()
+		if len(batch) == 0 {
 			return nil
 		}
-		n := p.cfg.BatchSize
-		if n > len(p.queue) {
-			n = len(p.queue)
-		}
-		batch := append([]*trace.Span(nil), p.queue[:n]...)
-		p.queue = append(p.queue[:0], p.queue[n:]...)
-		for _, s := range batch {
-			p.decRef(s.TraceID)
-		}
-		p.mu.Unlock()
-		p.notFull.Broadcast()
-
-		if err := p.exportBatch(ctx, batch); err != nil {
+		err := p.exportBatch(ctx, batch)
+		p.releaseBatchFinalized(batch)
+		if err != nil {
 			return err
 		}
 	}
+}
+
+// takeBatchLocked 从队首取出至多 BatchSize 个跨度并计入 leased；
+// 引用计数保持不变（这些跨度仍代表已被本管线接纳的资源）。
+// 调用时必须持有 p.mu。
+func (p *Processor) takeBatchLocked() []*trace.Span {
+	if len(p.queue) == 0 {
+		return nil
+	}
+	n := p.cfg.BatchSize
+	if n > len(p.queue) {
+		n = len(p.queue)
+	}
+	batch := append([]*trace.Span(nil), p.queue[:n]...)
+	p.queue = append(p.queue[:0], p.queue[n:]...)
+	p.leased += n
+	return batch
+}
+
+// releaseBatchFinalized 在批次到达终态（成功或死信）后释放其占用：
+// 减少 leased 与对应链路引用计数，并唤醒等待空位的提交者。
+func (p *Processor) releaseBatchFinalized(batch []*trace.Span) {
+	p.mu.Lock()
+	p.leased -= len(batch)
+	if p.leased < 0 {
+		p.leased = 0
+	}
+	for _, s := range batch {
+		p.decRef(s.TraceID)
+	}
+	p.mu.Unlock()
+	p.notFull.Broadcast()
 }
 
 // Stats 返回可查询状态快照。
@@ -311,6 +332,8 @@ func (p *Processor) Stats() ProcessorStats {
 		BackpressureDrops: p.backpressureDrops.Load(),
 		Retried:           p.retried.Load(),
 		InQueue:           len(p.queue),
+		Leased:            p.leased,
+		InFlight:          len(p.queue) + p.leased,
 		AdmittedTraces:    len(p.traceRefs),
 		DeadLetters:       len(p.deadLetters),
 		LastFailure:       p.lastFailure,
@@ -347,32 +370,22 @@ func (p *Processor) worker() {
 	}
 }
 
-// exportQueuedBatches 导出当前队列；每批至多 BatchSize，直到队列空或关闭。
+// exportQueuedBatches 导出当前队列；每批至多 BatchSize，直到队列空。
+// 单个批次失败（已入死信）不影响继续处理后续批次。
 func (p *Processor) exportQueuedBatches() {
 	for {
 		p.mu.Lock()
-		if len(p.queue) == 0 {
-			p.mu.Unlock()
+		batch := p.takeBatchLocked()
+		p.mu.Unlock()
+		if len(batch) == 0 {
 			return
 		}
-		n := p.cfg.BatchSize
-		if n > len(p.queue) {
-			n = len(p.queue)
-		}
-		batch := append([]*trace.Span(nil), p.queue[:n]...)
-		p.queue = append(p.queue[:0], p.queue[n:]...)
-		for _, s := range batch {
-			p.decRef(s.TraceID)
-		}
-		p.mu.Unlock()
-		p.notFull.Broadcast()
-
-		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.ExportTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.ExportTimeout*time.Duration(p.cfg.MaxAttempts))
 		err := p.exportBatch(ctx, batch)
 		cancel()
+		p.releaseBatchFinalized(batch)
 		if err != nil {
-			// 失败批次已进入死信；为避免关闭信号被阻塞，直接结束本轮。
-			return
+			return // 避免在持续故障期空转；等待下一个 tick/flush 信号
 		}
 	}
 }
@@ -384,8 +397,9 @@ func (p *Processor) exportQueuedBatches() {
 //     采用可被 ctx 取消的线性退避；期间状态可通过 Stats 查询；
 //   - rejected 为终态失败，立即进入死信，不浪费重试；
 //   - 重试耗尽同样进入死信，保留 TraceID/SpanID/原因，不丢失关键诊断；
-//   - 任一批次结果（成功或失败）在恢复后都不影响后续批次：成功即恢复
-//     Available=true，后续按相同确定语义继续。
+//   - 批次一经取出即不回队：失败只入死信，避免与后续批次混批或重复导出；
+//   - 任一批次结果都不影响后续批次：成功即恢复 Available=true，后续按
+//     相同确定语义继续。
 func (p *Processor) exportBatch(ctx context.Context, batch []*trace.Span) error {
 	if len(batch) == 0 {
 		return nil
@@ -395,7 +409,10 @@ func (p *Processor) exportBatch(ctx context.Context, batch []*trace.Span) error 
 
 	var lastErr error
 	for attempt := 1; attempt <= p.cfg.MaxAttempts; attempt++ {
-		err := p.cfg.Exporter.ExportSpans(ctx, batch)
+		// 每次尝试都在 ExportTimeout 内完成；父 ctx 的截止时间仍优先。
+		attemptCtx, cancel := context.WithTimeout(ctx, p.cfg.ExportTimeout)
+		err := p.cfg.Exporter.ExportSpans(attemptCtx, batch)
+		cancel()
 		if err == nil {
 			p.exported.Add(int64(len(batch)))
 			p.mu.Lock()
