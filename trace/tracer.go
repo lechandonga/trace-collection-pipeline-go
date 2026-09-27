@@ -16,6 +16,10 @@ type TracerConfig struct {
 	MaxSpanAge time.Duration
 	// SweepInterval 后台扫描未结束跨度的周期；0 表示不启用后台扫描。
 	SweepInterval time.Duration
+	// CloseSinkOnShutdown 为 true 时（默认），Tracer.Shutdown 会级联关闭
+	// Sink；多个 Tracer 共享同一 Sink 时应只保留一个为 true 或全部置为
+	// false 并由拥有方显式关闭 Sink。
+	CloseSinkOnShutdown bool
 }
 
 // Tracer 创建跨度并在进程内维护进行中的跨度索引。
@@ -46,6 +50,7 @@ func NewTracer(cfg TracerConfig) *Tracer {
 	if cfg.MaxSpanAge <= 0 {
 		cfg.MaxSpanAge = 30 * time.Second
 	}
+	cfg.CloseSinkOnShutdown = true
 	t := &Tracer{
 		cfg:    cfg,
 		idGen:  NewTraceID,
@@ -57,6 +62,14 @@ func NewTracer(cfg TracerConfig) *Tracer {
 		t.wg.Add(1)
 		go t.sweepLoop(cfg.SweepInterval)
 	}
+	return t
+}
+
+// NewTracerSharedSink 创建不随自身 Shutdown 级联关闭 Sink 的采集器，
+// 适用于多个组件级 Tracer 共享同一采集管线、由拥有方统一关闭的场景。
+func NewTracerSharedSink(cfg TracerConfig) *Tracer {
+	t := NewTracer(cfg)
+	t.cfg.CloseSinkOnShutdown = false
 	return t
 }
 
@@ -196,6 +209,39 @@ func (t *Tracer) recordDropUnsampled(s *Span, reason string) {
 	}
 }
 
+// StartWithParent 基于提取到的远端 SpanContext 创建子跨度。
+// 用于“跨组件传播”：组件 B 从载体 Extract 得到 A 的上下文后，
+// 用本方法把自己的服务端跨度挂到 A 的调用链下。
+// 采样标志严格继承，保证跨组件链路结论一致。
+func (t *Tracer) StartWithParent(ctx context.Context, remote SpanContext, name string, opts ...SpanOption) (context.Context, *Span) {
+	if !remote.IsValid() {
+		return t.Start(ctx, name, opts...)
+	}
+	now := t.cfg.Now()
+	span := &Span{
+		TraceID:    remote.TraceID,
+		SpanID:    t.spanID(),
+		ParentID:  remote.SpanID,
+		Service:   t.cfg.Service,
+		Name:      name,
+		Kind:      KindServer,
+		StartTime: now,
+		Sampled:   remote.Sampled,
+		Attributes: map[string]string{},
+	}
+	for _, o := range opts {
+		o(span)
+	}
+	span.onEnd = t.deliver
+
+	t.mu.Lock()
+	if !t.closed {
+		t.active[span.SpanID] = span
+	}
+	t.mu.Unlock()
+	return ContextWithSpan(ctx, span), span
+}
+
 // SweepStale 扫描并回收超过 MaxSpanAge 仍未结束的跨度。
 // 回收以“缺失结束”终态进入下游，不会留下悬挂未结束状态。
 // 主要用于测试中的确定性判定；后台扫描复用同一逻辑。
@@ -265,7 +311,7 @@ func (t *Tracer) Shutdown(ctx context.Context) error {
 		s.forceClose(t.cfg.Now(), t.deliver)
 	}
 
-	if t.cfg.Sink != nil {
+	if t.cfg.Sink != nil && t.cfg.CloseSinkOnShutdown {
 		return t.cfg.Sink.Shutdown()
 	}
 	return nil
