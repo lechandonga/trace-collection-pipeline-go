@@ -2,6 +2,7 @@ package export
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	trace "github.com/lechandonga/trace-collection-pipeline-go/trace"
@@ -39,17 +40,38 @@ type Exporter interface {
 	Shutdown(ctx context.Context) error
 }
 
-// FailureError 让导出错误携带结构化失败原因。
+// FailureError 让导出错误携带结构化失败原因，便于调用方按原因区分处理。
 type FailureError struct {
 	Reason FailureReason
 	Err    error
 }
 
 // Error 实现 error。
-func (e *FailureError) Error() string { panic("not implemented") }
+func (e *FailureError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("export failed (%s): %v", e.Reason, e.Err)
+	}
+	return fmt.Sprintf("export failed (%s)", e.Reason)
+}
 
 // Unwrap 支持 errors.Is/As 解包。
-func (e *FailureError) Unwrap() error { panic("not implemented") }
+func (e *FailureError) Unwrap() error { return e.Err }
 
 // Retryable 判断该原因是否允许重试。
-func (r FailureReason) Retryable() bool { panic("not implemented") }
+// 明确拒绝与关闭属于终态失败；超时/不可用/队列满允许重试。
+func (r FailureReason) Retryable() bool {
+	switch r {
+	case FailureTimeout, FailureUnavailable, FailureQueueFull:
+		return true
+	default:
+		return false
+	}
+}
+
+// AsFailureError 尝试把错误解析为 *FailureError。
+func AsFailureError(err error) (*FailureError, bool) {
+	if fe, ok := err.(*FailureError); ok {
+		return fe, true
+	}
+	return nil, false
+}
